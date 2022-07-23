@@ -3,25 +3,31 @@ import { EventEmitter } from "events";
 type Json = Record<string, any>;
 
 type Patch<T extends Json> = {
-  version: string;
-  parent?: string;
   range: string;
   data: any;
 };
 
+type Version<T> = {
+  id: string;
+  parents: string[];
+  children: string[];
+  patches: Patch<T>[];
+}
+
+type VersionInfo<T> = {
+  id: string;
+  patches: Patch<T>[];
+  parents: string[];
+}
+
+type History<T> = { root: string | undefined, latest: string | undefined, versions: Record<string, Version<T>> };
+
 type SyncObject<T extends Json> = {
   base: T;
-  patches: Patch<T>[];
-  peerVersions: Record<string, string>;
+  history: History<T>;
+  /* Record of all versions we know a peer has seen */
+  peerAcks: Record<string, Set<string>>;
 };
-
-function toSyncObject<T extends Json>(initial: T) {
-  return {
-    base: initial,
-    patches: [],
-    peerVersions: {}
-  };
-}
 
 function applyPatch<T extends Json>(base: T, patch: Patch<T>): T {
   // this is exteremely basic with no error checks, in real life you'd want a proper patching solution
@@ -39,53 +45,64 @@ function applyPatch<T extends Json>(base: T, patch: Patch<T>): T {
   }
 }
 
-// FIXME: NOT DETERMINISTIC LOL
 // deterministically insert a patch into history such that any set
 // of patches inserted at any time will end up with the same ordering
-function insertPatch<T extends Json>(history: Patch<T>[], patch: Patch<T>) {
+function insertVersion<T extends Json>(history: History<T>, info: VersionInfo<T>) {
+  if (history.versions[info.id]) {
+    console.log('I already have', info.id)
+    return;
+  }
   // iterate to find the parent in history. if parent is not found, insert at the
   // end?
   // special cases:
   // - inserting a patch with no parent into a list which already has parenting
   // - inserting a patch whose parent is not found in the list? probably the same as above.
 
-  const parentIndex = history.findIndex((p) => p.version === patch.parent);
-
-  if (parentIndex === -1) {
-    if (history.length === 0) {
+  if (!info.parents.length) {
+    if (Object.keys(history.versions).length === 0) {
       // brand new history, first patch.
-      history.push(patch);
-      return history.length - 1;
+      history.versions[info.id] = {
+        id: info.id,
+        parents: info.parents,
+        children: [],
+        patches: info.patches
+      };
+      history.root = info.id;
+      history.latest = info.id;
     } else {
       throw new Error(
-        "Cannot insert patch with version " +
-          patch.version +
-          " and parent " +
-          patch.parent +
+        "Cannot insert version " +
+          info.id +
+          " with parents " +
+          info.parents +
           ": parent not found in history. I know of: " +
-          history.map((p) => p.version).join(", ")
+          Object.keys(history.versions)
       );
     }
+  } else if (!history.root) {
+    throw new Error(
+      `Cannot insert version ${info.id} with parents ${info.parents}: history has no root`
+    )
   } else {
-    // the next N patches could have the same parent.
-    // to insert deterministically, we compare versions and
-    // insert in lexical order among other siblings
-    let insertionIndex = parentIndex + 1;
-    while (
-      history[insertionIndex] &&
-      history[insertionIndex].parent === patch.parent &&
-      history[insertionIndex].version < patch.version
-    ) {
-      insertionIndex++;
+    // find all parents ad add as child
+    for (const parent of info.parents) {
+      const parentVersion = history.versions[parent];
+      if (!parentVersion) {
+        throw new Error(
+          `Cannot insert version ${info.id} with parents ${info.parents}: parent not found in history. I know of: ${Object.keys(
+            history.versions
+          )}`
+        );
+      }
+      parentVersion.children.push(info.id);
+      parentVersion.children.sort();
     }
-    // special case: the patch already exists in our history
-    if (history[insertionIndex]?.version === patch.version) {
-      console.log("I already have", patch.version);
-      return insertionIndex;
-    }
-
-    history.splice(insertionIndex, 0, patch);
-    return insertionIndex;
+    history.versions[info.id] = {
+      id: info.id,
+      parents: info.parents,
+      children: [],
+      patches: info.patches
+    };
   }
 }
 
@@ -93,21 +110,36 @@ function generateVersion() {
   return Math.floor(Math.random() * 1000000).toFixed(0);
 }
 
+function traverseHistory<T>(history: History<T>, visitor: (v: Version<T>) => void) {
+  if (!history.root) return;
+  traverseFromVersion(history, history.root, visitor);
+}
+function traverseFromVersion(history: History<Json>, version: string, visitor: (v: Version<Json>) => void) {
+  let current = history.versions[version];
+  visitor(current);
+  // breadth-first traversal
+  for (const child of current.children) {
+    visitor(history.versions[child]);
+  }
+  for (const child of current.children) {
+    traverseFromVersion(history, child, visitor);
+  }
+}
+
+
 // message protocol types
 type MessageHello<T extends Json> = {
-  catchup: Record<string, Patch<T>[]>;
+  catchup: Record<string, VersionInfo<T>[]>;
 };
 
 type MessageHelloBack<T extends Json> = {
-  // TODO: this might be redudnant
-  acks: Record<string, string>;
-  catchup: Record<string, Patch<T>[]>;
+  catchup: Record<string, VersionInfo<T>[]>;
 };
 
-type MessageHelloBackBack = {
-  // TODO: this might be redundant
-  acks: Record<string, string>;
-};
+type MessageAckVersion = {
+  objectId: string;
+  version: string;
+}
 
 type MessageRealtimePatch<T> = {
   sourcePeer: string;
@@ -125,6 +157,7 @@ export class SyncClient<T> extends EventEmitter {
   private _views = {} as Record<string, T>;
   topic: string;
   identity: string;
+  private isServer: boolean;
 
   private _peers: Record<string, SyncClient<T>> = {};
   get peers() {
@@ -134,19 +167,27 @@ export class SyncClient<T> extends EventEmitter {
   constructor({
     identity,
     topic,
-    seed
+    seed,
+    isServer
   }: {
     identity: string;
     topic: string;
     seed?: Record<string, T>;
+    isServer?: boolean;
   }) {
     super();
 
     this.identity = identity;
     this.topic = topic;
+    this.isServer = !!isServer;
+
     if (seed) {
       this._objects = Object.entries(seed).reduce((acc, [key, value]) => {
-        acc[key] = toSyncObject(value);
+        acc[key] = {
+          base: value,
+          history: { root: undefined, latest: undefined, versions: {} },
+          peerAcks: { [this.identity]: new Set() }
+        }
         return acc;
       }, {} as Record<string, SyncObject<T>>);
       for (const key of Object.keys(this._objects)) {
@@ -157,7 +198,11 @@ export class SyncClient<T> extends EventEmitter {
 
   private refreshView = (id: string) => {
     const obj = this._objects[id];
-    this._views[id] = obj.patches.reduce(applyPatch, obj.base);
+    let view = obj.base;
+    traverseHistory(obj.history, v => {
+      view = v.patches.reduce(applyPatch, view);
+    });
+    this._views[id] = view;
   };
 
   get = (id: string) => {
@@ -184,16 +229,21 @@ export class SyncClient<T> extends EventEmitter {
   set = (id: string, range: string, value: any) => {
     const obj = this._objects[id];
     if (!obj) throw new Error("No object with id " + id);
-    const parent = obj.patches.length
-      ? obj.patches[obj.patches.length - 1].version
-      : undefined;
-    const patch = {
-      parent,
-      version: generateVersion(),
+    const parent = obj.history.latest;
+    const patch: Patch<T> = {
       range,
       data: value
     };
-    insertPatch(obj.patches, patch);
+    const version = {
+      id: generateVersion(),
+      parents: parent ? [parent] : [],
+      patches: [patch]
+    };
+    insertVersion(obj.history, version);
+    obj.history.latest = version.id;
+
+    // self-ack the version
+    this.receiveVersionAck(this.identity, { objectId: id, version: version.id });
 
     this.refreshView(id);
     this.emit(`change:${id}`);
@@ -201,171 +251,150 @@ export class SyncClient<T> extends EventEmitter {
 
     // simulated network push of patch to connected peers
     for (const peer of Object.values(this._peers)) {
-      peer.receiveRealtimePatch(this.identity, {
-        sourcePeer: this.identity,
+      peer.receiveVersion(this.identity, {
         objectId: id,
-        patch
+        version,
       });
     }
   };
 
-  private receivePatches = (
+  private receiveVersion = (
     fromPeer: string,
-    objectId: string,
-    patches: Patch<T>[]
+    { objectId, version }: {
+      objectId: string;
+      version: VersionInfo<T>;
+    }
   ) => {
     const obj = this._objects[objectId];
     if (!obj) throw new Error("No object with id " + objectId);
-    let earliestInsertedIndex = Infinity;
-    for (const patch of patches) {
-      const insertedAt = insertPatch(obj.patches, patch);
-      earliestInsertedIndex = Math.min(earliestInsertedIndex, insertedAt);
-    }
 
-    // record the latest version we know that peer has seen.
-    const latestVersion = patches[patches.length - 1].version;
-    obj.peerVersions[fromPeer] = latestVersion;
-
+    insertVersion(obj.history, version);
     this.refreshView(objectId);
-    this.emit(`change:${objectId}`);
 
-    if (earliestInsertedIndex !== Infinity) {
-      for (const peerId of Object.keys(obj.peerVersions)) {
+    // self-ack the version
+    this.receiveVersionAck(this.identity, { objectId: objectId, version: version.id })
+    // ack the version for the peer that sent
+    this.receiveVersionAck(fromPeer, { objectId: objectId, version: version.id })
+
+    // ack to the sender if we are connected to them
+    this._peers[fromPeer]?.receiveVersionAck(this.identity, { objectId, version: version.id });
+
+    // TODO: UNVALIDATED ASSUMPTION
+    obj.history.latest = version.id;
+
+    if (this.isServer) {
+      for (const peerId of Object.keys(this._peers)) {
         if (peerId === fromPeer) continue;
 
-        this.rewindPeer(peerId, objectId, earliestInsertedIndex);
+        // emit to all other peers
+        this._peers[peerId].receiveVersion(this.identity, {
+          objectId,
+          version,
+        });
       }
     }
+
+    this.emit(`change:${objectId}`);
   };
 
-  private rewindPeer = (peerId: string, objectId: string, versionIndex: number) => {
+  private receiveVersionAck = (
+    fromPeer: string,
+    { objectId, version }: MessageAckVersion
+  ) => {
     const obj = this._objects[objectId];
     if (!obj) throw new Error("No object with id " + objectId);
-    const peerVersion = obj.peerVersions[peerId];
-    if (peerVersion && obj.patches.findIndex((p) => p.version === peerVersion) < versionIndex) {
-      // peer is already further back in history
-      return;
-    }
-    obj.peerVersions[peerId] = obj.patches[versionIndex].version;
-    // if peer is online, send immediately
-    if (this._peers[peerId]) {
-      this._peers[peerId].receiveHelloBack(
-        this.identity,
-        { acks: {},
-        catchup: { [objectId]:
-        obj.patches.slice(versionIndex)
-        },
-      }
-      );
-    }
-  }
-
-  private receiveRealtimePatch = (
-    fromPeer: string,
-    msg: MessageRealtimePatch<T>
-  ) => {
-    this.receivePatches(fromPeer, msg.objectId, [msg.patch]);
-    for (const peer of Object.values(this._peers)) {
-      if (peer.identity !== fromPeer && peer.identity !== msg.sourcePeer) {
-        peer.receiveRealtimePatch(this.identity, msg);
-      }
-    }
-
-    // TODO: prevent infinite gossip loops
-
-    this._peers[fromPeer].receiveRealtimePatchAck(this.identity, {
-      objectId: msg.objectId,
-      version: msg.patch.version
-    });
-  };
-
-  private receiveRealtimePatchAck = (
-    fromPeer: string,
-    msg: MessageRealtimePatchAck
-  ) => {
-    this._objects[msg.objectId].peerVersions[fromPeer] = msg.version;
+    if (!obj.peerAcks[fromPeer]) obj.peerAcks[fromPeer] = new Set();
+    obj.peerAcks[fromPeer].add(version);
+    console.log(this.identity, 'received ack of', version, 'from', fromPeer);
   };
 
   private receiveHello = (fromPeer: string, msg: MessageHello<T>) => {
-    const acks: Record<string, string> = {};
-    for (const [id, patches] of Object.entries(msg.catchup)) {
-      this.receivePatches(fromPeer, id, patches);
-      const ourLatestVersion = this._objects[id].patches[
-        this._objects[id].patches.length - 1
-      ].version;
-      acks[id] = ourLatestVersion;
+    for (const [id, versions] of Object.entries(msg.catchup)) {
+      for (const version of versions) {
+        this.receiveVersion(fromPeer, { objectId: id, version });
+      }
+      // case: server connects to new client and learns of a divergent
+      // history branch. server needs to merge the branches and
+      // send the new history to the new client.
+      if (this.isServer) {
+        this.mergeLeaves(this._objects[id])
+      }
     }
-    const backPatches = this.getPatchesFor(fromPeer)
+    const backlog = this.getVersionsFor(fromPeer)
     console.log(this.identity, 'hello backing', fromPeer)
     this._peers[fromPeer].receiveHelloBack(this.identity, {
-      acks,
-      catchup: backPatches
+      catchup: backlog
     });
+
 
     // case: server is connected to one client and another client
     // comes online.
     // we want the first client to receive their copy of
     // the second client's new history bootstraps
-    for (const peer of Object.values(this._peers)) {
-      if (peer.identity === fromPeer) continue;
+    if (this.isServer) {
+      for (const peer of Object.values(this._peers)) {
+        if (peer.identity === fromPeer) continue;
 
-      // TODO: this probably deserves its own protocol exchange
-      console.log(this.identity, 'catching up peer', peer.identity, 'with new hello patches from', fromPeer);
-      peer.receiveHelloBack(this.identity, {
-        catchup: this.getPatchesFor(peer.identity),
-        acks: {}
-      });
-    }
-  };
-
-  private receiveHelloBack = (fromPeer: string, msg: MessageHelloBack<T>) => {
-    for (const [id, version] of Object.entries(msg.acks)) {
-      this._objects[id].peerVersions[fromPeer] = version;
-    }
-
-    const acks: Record<string, string> = {};
-    for (const [id, patches] of Object.entries(msg.catchup)) {
-      this.receivePatches(fromPeer, id, patches);
-      const ourLatestVersion = this._objects[id].patches[
-        this._objects[id].patches.length - 1
-      ].version;
-      acks[id] = ourLatestVersion;
-    }
-    console.log(this.identity, 'hello-back-backing', fromPeer);
-    this._peers[fromPeer].receiveHelloBackBack(this.identity, { acks });
-  };
-
-  private receiveHelloBackBack = (
-    fromPeer: string,
-    msg: MessageHelloBackBack
-  ) => {
-    for (const [id, version] of Object.entries(msg.acks)) {
-      this._objects[id].peerVersions[fromPeer] = version;
-    }
-  };
-
-  private getPatchesFor = (peerId: string) => {
-    const patches: Record<string, Patch<T>[]> = {};
-    for (const [id, obj] of Object.entries(this._objects)) {
-      const peerVersion = obj.peerVersions[peerId];
-      let relativeHistoryStart = obj.patches.findIndex(
-        (p) => p.version === peerVersion
-      );
-      // if the peer has never been seen before, send all history
-      // TODO: good idea?
-      const patchRange = obj.patches.slice(relativeHistoryStart + 1);
-      if (patchRange.length) {
-        console.log(`${this.identity} sees ${peerId} at ${peerVersion}`);
-        console.log(
-          `${this.identity} sending ${patchRange.length} patches to peer ${peerId} for object ${id}`
-        );
-        patches[id] = patchRange;
+        // TODO: this probably deserves its own protocol exchange
+        console.log(this.identity, 'catching up peer', peer.identity, 'with new hello patches from', fromPeer);
+        peer.receiveHelloBack(this.identity, {
+          catchup: this.getVersionsFor(peer.identity),
+        });
       }
     }
-    return patches;
+  };
+
+  private mergeLeaves = (obj: SyncObject<T>) => {
+    const leaves = Object.values(obj.history.versions).filter(v => v.children.length === 0);
+    if (leaves.length === 1) return leaves[0];
+    const merge: Version<T> = {
+      id: generateVersion(),
+      parents: leaves.map(v => v.id),
+      // empty patches - this just exists to link the branches together
+      patches: [],
+      children: []
+    }
+    obj.history.versions[merge.id] = merge;
+    obj.history.latest = merge.id;
+    return merge;
+  }
+
+  private receiveHelloBack = (fromPeer: string, msg: MessageHelloBack<T>) => {
+    for (const [id, versions] of Object.entries(msg.catchup)) {
+      for (const version of versions) {
+        this.receiveVersion(fromPeer, { objectId:id, version });
+      }
+    }
+  };
+
+  private getVersionsFor = (peerId: string) => {
+    const versions: Record<string, Version<T>[]> = {};
+    for (const [id, obj] of Object.entries(this._objects)) {
+      // get the acked versions for this peer, defaulting to a new set if needed
+      const peerVersions = obj.peerAcks[peerId] = (obj.peerAcks[peerId] || new Set());
+
+      // one catch here is that versions have to be sent in order,
+      // oldest first.
+      for (const version of Object.keys(obj.history.versions)) {
+        if (!peerVersions.has(version)) {
+          if (!versions[id]) versions[id] = [];
+          const versionList = versions[id];
+          // FIXME: this is going to be ugly
+          const childIndex = versionList.findIndex(v => v.parents.includes(version));
+          if (childIndex !== -1) {
+            // insert before child
+            versionList.splice(childIndex, 0, obj.history.versions[version]);
+          } else {
+            versions[id].push(obj.history.versions[version]);
+          }
+        }
+      }
+    }
+    return versions;
   };
 
   connect = (peer: SyncClient<T>) => {
+    console.log(this.identity, 'connecting to', peer.identity);
     // rest spreading to create a new object because React... eh.
     this._peers = { ...this._peers, [peer.identity]: peer };
     // simulate mutual connection
@@ -378,7 +407,7 @@ export class SyncClient<T> extends EventEmitter {
     //   this peer needs
     // - this peer acks the history
     peer.receiveHello(this.identity, {
-      catchup: this.getPatchesFor(peer.identity)
+      catchup: this.getVersionsFor(peer.identity)
     });
 
     this.emit("connected", peer.identity);

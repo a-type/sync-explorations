@@ -12,11 +12,10 @@ type Value = {
 const topic = "test";
 const seed = {
   a: { value: 0 },
-  b: { value: 0 }
 };
 const clientA = new SyncClient<Value>({ topic, seed, identity: "clientA" });
 const clientB = new SyncClient<Value>({ topic, seed, identity: "clientB" });
-const server = new SyncClient<Value>({ topic, seed, identity: "server" });
+const server = new SyncClient<Value>({ topic, seed, identity: "server", isServer: true });
 
 const peers = {
   clientA,
@@ -40,7 +39,7 @@ function ObjectView({ id }: { id: string }) {
     client.set(id, "value", object.value + 1);
   }
 
-  const { patches, peerVersions } = client.getRaw(id)!;
+  const { history, peerAcks: peerVersions } = client.getRaw(id)!;
 
   return (
     <details open>
@@ -50,16 +49,28 @@ function ObjectView({ id }: { id: string }) {
         <button onClick={increment}>+</button>
       </summary>
       <ol>
-        {patches.map((p) => (
-          <li key={p.version}>
-            {p.version} (parent: {p.parent})
+        {Object.keys(history.versions).sort().map((key) => (
+          <li key={key}>
+            <div>{key}</div>
+            <div>{JSON.stringify(history.versions[key].patches)}</div>
+            <div>parents: {history.versions[key].parents.join(',')}</div>
+            <div>children:</div>
+            <ul>
+              {history.versions[key].children.map(c => <li key={c}>{c}</li>)}
+            </ul>
           </li>
         ))}
       </ol>
       <div>
-        {Object.entries(peerVersions).map(([ident, version]) => (
+        <h3>My stats</h3>
+        <div>Root: {history.root}</div>
+        <div>Latest: {history.latest}</div>
+      </div>
+      <div>
+        <h3>Peer stats</h3>
+        {Object.entries(peerVersions).map(([ident, versions]) => (
           <div key={ident}>
-            I see {ident} at {version}
+            I see {ident} has {new Array(...versions).join(', ')}
           </div>
         ))}
       </div>
@@ -98,7 +109,9 @@ export function ClientView({ client }: { client: SyncClient<Value> }) {
           flexDirection: "column",
           gap: "4px",
           border: "1px solid black",
-          padding: "12px"
+          padding: "12px",
+          width: '20vw',
+          height: '100%'
         }}
       >
         {client.identity}
@@ -123,7 +136,7 @@ export function ClientView({ client }: { client: SyncClient<Value> }) {
 
 export function App() {
   return (
-    <div style={{ display: "flex", flexDirection: "row", gap: "8px" }}>
+    <div style={{ display: "flex", flexDirection: "row", gap: "8px", height: '80vh' }}>
       <ClientView client={clientA} />
       <ClientView client={clientB} />
       <ClientView client={server} />
