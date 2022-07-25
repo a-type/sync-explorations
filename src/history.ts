@@ -3,13 +3,14 @@
 import { History, Json, VersionInfo } from './types';
 
 // of patches inserted at any time will end up with the same ordering
+// returns true if version was inserted, false if it was duplicate.
 export function insertVersion<T extends Json>(
 	history: History<T>,
 	info: VersionInfo<T>
-) {
+): boolean {
 	if (history.versions[info.id]) {
 		console.log('I already have', info.id);
-		return;
+		return false;
 	}
 	// iterate to find the parent in history. if parent is not found, insert at the
 	// end?
@@ -65,6 +66,8 @@ export function insertVersion<T extends Json>(
 			patches: info.patches,
 		};
 	}
+
+	return true;
 }
 
 export function generateVersion() {

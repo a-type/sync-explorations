@@ -8,12 +8,19 @@ type Bubble<T extends Json> = {
 	contains: string[];
 };
 
+export type Collapse<T> = {
+	newBase: T;
+	newRoot: string | undefined;
+	removeVersions: string[];
+	objectId: string;
+};
+
 export const getHistoryCollapse = <T extends Json>(
 	identity: string,
 	objectId: string,
 	obj: SyncObject<T>,
 	knownPeers: Set<string>
-) => {
+): Collapse<T> | null => {
 	// we can collapse history for any versions which meet the criteria:
 	// every version in the version range has been acked by every known peer
 	// we don't leave any dangling branches

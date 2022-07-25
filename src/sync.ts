@@ -1,5 +1,5 @@
 import { EventEmitter } from 'events';
-import { getHistoryCollapse } from './collapsing';
+import { Collapse, getHistoryCollapse } from './collapsing';
 import { generateVersion, insertVersion } from './history';
 import { applyPatch } from './patches';
 import { clone } from './syncObjects';
@@ -23,11 +23,13 @@ type ObjectChangesSummary<T> = {
 type MessageHello<T extends Json> = {
 	catchup: Record<string, ObjectChangesSummary<T>>;
 	missingObjects: Record<string, SyncObject<T>>;
+	knownPeers: string[];
 };
 
 type MessageHelloBack<T extends Json> = {
 	catchup: Record<string, ObjectChangesSummary<T>>;
 	missingObjects: Record<string, SyncObject<T>>;
+	knownPeers: string[];
 };
 
 type MessageHelloBackBack<T extends Json> = {
@@ -140,10 +142,7 @@ export class SyncClient<T> extends EventEmitter {
 		obj.history.latest = version.id;
 
 		// self-ack the version
-		this.receiveVersionAck(this.identity, {
-			objectId: id,
-			version: version.id,
-		});
+		this.updateVersionAck(id, this.identity, version.id);
 
 		this.refreshView(id);
 		this.emit(`change:${id}`);
@@ -151,11 +150,19 @@ export class SyncClient<T> extends EventEmitter {
 
 		// simulated network push of patch to connected peers
 		for (const peer of Object.values(this._peers)) {
-			peer.receiveVersion(this.identity, {
-				objectId: id,
-				version,
+			this.simulateSend(() => {
+				peer.receiveVersion(this.identity, {
+					objectId: id,
+					version,
+				});
 			});
 		}
+	};
+
+	// simulated send - queues a task to run the callback
+	// latency could be added...
+	private simulateSend = (send: () => void) => {
+		setTimeout(send, 10);
 	};
 
 	private receiveVersion = (
@@ -171,53 +178,96 @@ export class SyncClient<T> extends EventEmitter {
 		const obj = this._objects[objectId];
 		if (!obj) throw new Error('No object with id ' + objectId);
 
-		insertVersion(obj.history, version);
-		this.refreshView(objectId);
+		console.log(
+			this.identity,
+			'received version',
+			version.id,
+			'from',
+			fromPeer
+		);
 
-		// self-ack the version
-		this.receiveVersionAck(this.identity, {
-			objectId: objectId,
-			version: version.id,
-		});
+		const wasNew = insertVersion(obj.history, version);
+		if (wasNew) {
+			this.refreshView(objectId);
+			// self-ack the version
+			this.updateVersionAck(objectId, this.identity, version.id);
+		}
+
 		// ack the version for the peer that sent
-		this.receiveVersionAck(fromPeer, {
-			objectId: objectId,
-			version: version.id,
+		this.updateVersionAck(objectId, fromPeer, version.id);
+
+		this.simulateSend(() => {
+			// ack to the sender if we are connected to them
+			this._peers[fromPeer]?.receiveVersionAck(this.identity, {
+				objectId,
+				version: version.id,
+			});
 		});
 
-		// ack to the sender if we are connected to them
-		this._peers[fromPeer]?.receiveVersionAck(this.identity, {
-			objectId,
-			version: version.id,
-		});
+		if (wasNew) {
+			// TODO: UNVALIDATED ASSUMPTION
+			console.log(this.identity, 'set latest to', version.id);
+			obj.history.latest = version.id;
 
-		// TODO: UNVALIDATED ASSUMPTION
-		obj.history.latest = version.id;
+			this.collapseObjectHistory(objectId);
+		}
 
-		if (this.isServer) {
+		if (wasNew && this.isServer) {
 			for (const peerId of Object.keys(this._peers)) {
 				if (peerId === fromPeer) continue;
 
 				// emit to all other peers
-				this._peers[peerId].receiveVersion(this.identity, {
-					objectId,
-					version,
+				this.simulateSend(() => {
+					this._peers[peerId].receiveVersion(this.identity, {
+						objectId,
+						version,
+					});
+					// also transmit the ack from the original sender
+					this._peers[peerId].receiveVersionAck(fromPeer, {
+						objectId,
+						version: version.id,
+					});
 				});
 			}
 		}
 
-		this.emit(`change:${objectId}`);
+		if (wasNew) {
+			this.emit(`change:${objectId}`);
+		}
+	};
+
+	private updateVersionAck = (
+		objectId: string,
+		peerId: string,
+		version: string
+	) => {
+		const obj = this._objects[objectId];
+		if (!obj) throw new Error('No object with id ' + objectId);
+		if (!obj.peerAcks[peerId]) obj.peerAcks[peerId] = new Set();
+		obj.peerAcks[peerId].add(version);
 	};
 
 	private receiveVersionAck = (
 		fromPeer: string,
 		{ objectId, version }: MessageAckVersion
 	) => {
-		const obj = this._objects[objectId];
-		if (!obj) throw new Error('No object with id ' + objectId);
-		if (!obj.peerAcks[fromPeer]) obj.peerAcks[fromPeer] = new Set();
-		obj.peerAcks[fromPeer].add(version);
+		this.updateVersionAck(objectId, fromPeer, version);
 		console.log(this.identity, 'received ack of', version, 'from', fromPeer);
+
+		this.collapseObjectHistory(objectId);
+
+		if (this.isServer) {
+			// broadcast ack to other clients
+			for (const peerId of Object.keys(this._peers)) {
+				if (peerId === fromPeer) continue;
+				this.simulateSend(() => {
+					this._peers[peerId].receiveVersionAck(fromPeer, {
+						objectId,
+						version,
+					});
+				});
+			}
+		}
 	};
 
 	private mergePeerAcks = (
@@ -268,9 +318,11 @@ export class SyncClient<T> extends EventEmitter {
 					objectId: id,
 					version,
 				});
-				this._peers[fromPeer]?.receiveVersionAck(this.identity, {
-					objectId: id,
-					version,
+				this.simulateSend(() => {
+					this._peers[fromPeer]?.receiveVersionAck(this.identity, {
+						objectId: id,
+						version,
+					});
 				});
 			}
 		}
@@ -280,15 +332,20 @@ export class SyncClient<T> extends EventEmitter {
 		console.log(this.identity, 'received hello from', fromPeer, msg);
 		this.applyCatchup(fromPeer, msg.catchup);
 		this.applyMissingObjects(fromPeer, msg.missingObjects);
+		mergeToSet(this._knownPeers, msg.knownPeers);
 
 		const backlog = this.getChangeSummariesFor(fromPeer);
 		console.log(this.identity, 'hello backing', fromPeer);
-		this._peers[fromPeer].receiveHelloBack(this.identity, {
-			catchup: backlog.summaries,
-			missingObjects: backlog.missingObjects,
+		this.simulateSend(() => {
+			this._peers[fromPeer].receiveHelloBack(this.identity, {
+				catchup: backlog.summaries,
+				missingObjects: backlog.missingObjects,
+				knownPeers: Array.from(this._knownPeers),
+			});
 		});
 
-		setTimeout(this.collapseAllHistory, 3000);
+		// TODO: do we need an ack first?
+		this.collapseAllHistory();
 
 		// case: server is connected to one client and another client
 		// comes online.
@@ -309,12 +366,17 @@ export class SyncClient<T> extends EventEmitter {
 				const { summaries, missingObjects } = this.getChangeSummariesFor(
 					peer.identity
 				);
-				peer.receiveHelloBack(this.identity, {
-					catchup: summaries,
-					missingObjects,
+				this.simulateSend(() => {
+					peer.receiveHelloBack(this.identity, {
+						catchup: summaries,
+						missingObjects,
+						knownPeers: Array.from(this._knownPeers),
+					});
 				});
 			}
 		}
+
+		this.emit('connected', fromPeer);
 	};
 
 	private mergeLeaves = (obj: SyncObject<T>) => {
@@ -338,8 +400,12 @@ export class SyncClient<T> extends EventEmitter {
 		console.log(this.identity, 'received hello back from', fromPeer, msg);
 		this.applyCatchup(fromPeer, msg.catchup);
 		this.applyMissingObjects(fromPeer, msg.missingObjects);
+		mergeToSet(this._knownPeers, msg.knownPeers);
 
-		setTimeout(this.collapseAllHistory, 3000);
+		// TODO: do we need to ack first?
+		this.collapseAllHistory();
+
+		this.emit('connected', fromPeer);
 	};
 
 	private getChangeSummariesFor = (peerId: string) => {
@@ -399,10 +465,14 @@ export class SyncClient<T> extends EventEmitter {
 
 	private collapseAllHistory = () => {
 		for (const id of Object.keys(this._objects)) {
-			const collapse = this.getHistoryCollapse(id, this._objects[id]);
-			if (collapse) {
-				this.applyCollapse(collapse);
-			}
+			this.collapseObjectHistory(id);
+		}
+	};
+
+	private collapseObjectHistory = (id: string) => {
+		const collapse = this.getHistoryCollapse(id, this._objects[id]);
+		if (collapse) {
+			this.applyCollapse(collapse);
 		}
 	};
 
@@ -410,7 +480,7 @@ export class SyncClient<T> extends EventEmitter {
 		return getHistoryCollapse(this.identity, objectId, obj, this._knownPeers);
 	};
 
-	private applyCollapse = (msg: MessageCollapse<T>) => {
+	private applyCollapse = (msg: Collapse<T>) => {
 		console.log(
 			this.identity,
 			'collapsing history',
@@ -443,11 +513,12 @@ export class SyncClient<T> extends EventEmitter {
 		// special case: if history is totally collapsed, we should
 		// reset latest
 		if (Object.keys(obj.history.versions).length === 0) {
+			console.log(this.identity, 'resetting latest');
 			obj.history.latest = undefined;
 		}
 		// also clear the acked versions for all peers since they no longer need to be stored.
 		for (const peer of Object.keys(obj.peerAcks)) {
-			console.log('removing acks', peer, msg.removeVersions);
+			console.log(this.identity, 'removing acks', peer, msg.removeVersions);
 			removeFromSet(obj.peerAcks[peer], msg.removeVersions);
 		}
 		this.refreshView(msg.objectId);
@@ -471,13 +542,17 @@ export class SyncClient<T> extends EventEmitter {
 		//   this peer needs
 		// - this peer acks the history
 		const initialHello = this.getChangeSummariesFor(peer.identity);
-		peer.receiveHello(this.identity, {
-			catchup: initialHello.summaries,
-			missingObjects: initialHello.missingObjects,
+		this.simulateSend(() => {
+			peer.receiveHello(this.identity, {
+				catchup: initialHello.summaries,
+				missingObjects: initialHello.missingObjects,
+				knownPeers: Array.from(this._knownPeers),
+			});
 		});
 
-		this.emit('connected', peer.identity);
-		peer.emit('connected', this.identity);
+		// moved to hello/helloback handlers
+		// this.emit('connected', peer.identity);
+		// peer.emit('connected', this.identity);
 		console.log(this.identity, 'connected to', peer.identity);
 	};
 
