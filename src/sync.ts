@@ -1,187 +1,51 @@
 import { EventEmitter } from 'events';
-
-type Json = Record<string, any>;
-
-type Patch<T extends Json> = {
-	range: string;
-	data: any;
-};
-
-type Version<T> = {
-	id: string;
-	parents: string[];
-	children: string[];
-	patches: Patch<T>[];
-};
-
-type VersionInfo<T> = {
-	id: string;
-	patches: Patch<T>[];
-	parents: string[];
-};
-
-type History<T> = {
-	root: string | undefined;
-	latest: string | undefined;
-	versions: Record<string, Version<T>>;
-};
-
-export type SyncObject<T extends Json> = {
-	base: T;
-	history: History<T>;
-	/* Record of all versions we know a peer has seen */
-	peerAcks: Record<string, Set<string>>;
-};
-
-// this is exteremely basic with no error checks, in real life you'd want a proper patching solution
-function applyPatch<T extends Json>(base: T, patch: Patch<T>): T {
-	if (patch.range.startsWith('-')) {
-		// delete patch
-		const [key, ...rest] = patch.range.slice(1).split('.');
-		if (rest.length === 0) {
-			delete base[key];
-			return base;
-		} else {
-			return {
-				...base,
-				[key as keyof T]: applyPatch(base[key as keyof T], {
-					...patch,
-					range: '-' + rest.join('.'),
-				}),
-			};
-		}
-	} else {
-		const [key, ...rest] = patch.range.split('.');
-		if (rest.length === 0) {
-			return { ...base, [key as keyof T]: patch.data };
-		} else {
-			return {
-				...base,
-				[key as keyof T]: applyPatch(base[key as keyof T], {
-					...patch,
-					range: rest.join('.'),
-				}),
-			};
-		}
-	}
-}
-
-// deterministically insert a patch into history such that any set
-// of patches inserted at any time will end up with the same ordering
-function insertVersion<T extends Json>(
-	history: History<T>,
-	info: VersionInfo<T>
-) {
-	if (history.versions[info.id]) {
-		console.log('I already have', info.id);
-		return;
-	}
-	// iterate to find the parent in history. if parent is not found, insert at the
-	// end?
-	// special cases:
-	// - inserting a patch with no parent into a list which already has parenting
-	// - inserting a patch whose parent is not found in the list? probably the same as above.
-
-	if (!info.parents.length) {
-		if (Object.keys(history.versions).length === 0) {
-			// brand new history, first patch.
-			history.versions[info.id] = {
-				id: info.id,
-				parents: info.parents,
-				children: [],
-				patches: info.patches,
-			};
-			history.root = info.id;
-			history.latest = info.id;
-		} else {
-			throw new Error(
-				'Cannot insert version ' +
-					info.id +
-					' with parents ' +
-					info.parents +
-					': parent not found in history. I know of: ' +
-					Object.keys(history.versions)
-			);
-		}
-	} else if (!history.root) {
-		throw new Error(
-			`Cannot insert version ${info.id} with parents ${info.parents}: history has no root`
-		);
-	} else {
-		// find all parents ad add as child
-		for (const parent of info.parents) {
-			const parentVersion = history.versions[parent];
-			if (!parentVersion) {
-				throw new Error(
-					`Cannot insert version ${info.id} with parents ${
-						info.parents
-					}: parent not found in history. I know of: ${Object.keys(
-						history.versions
-					)}`
-				);
-			}
-			parentVersion.children.push(info.id);
-			parentVersion.children.sort();
-		}
-		history.versions[info.id] = {
-			id: info.id,
-			parents: info.parents,
-			children: [],
-			patches: info.patches,
-		};
-	}
-}
-
-function generateVersion() {
-	return Math.floor(Math.random() * 1000000).toFixed(0);
-}
-
-function traverseHistory<T>(
-	history: History<T>,
-	visitor: (v: Version<T>) => void
-) {
-	if (!history.root) return;
-	traverseFromVersion(history, history.root, visitor);
-}
-function traverseFromVersion(
-	history: History<Json>,
-	version: string,
-	visitor: (v: Version<Json>) => void
-) {
-	let current = history.versions[version];
-	visitor(current);
-	// breadth-first traversal
-	for (const child of current.children) {
-		visitor(history.versions[child]);
-	}
-	for (const child of current.children) {
-		traverseFromVersion(history, child, visitor);
-	}
-}
+import { getHistoryCollapse } from './collapsing';
+import { generateVersion, insertVersion } from './history';
+import { applyPatch } from './patches';
+import { clone } from './syncObjects';
+import { traverseHistory } from './traversal';
+import {
+	Json,
+	Patch,
+	VersionInfo,
+	History,
+	Version,
+	SyncObject,
+} from './types';
+import { mergeToSet, removeFromSet } from './utils';
 
 // message protocol types
+type ObjectChangesSummary<T> = {
+	versions: VersionInfo<T>[];
+	peerAcks: Record<string, string[]>;
+};
+
 type MessageHello<T extends Json> = {
-	catchup: Record<string, VersionInfo<T>[]>;
+	catchup: Record<string, ObjectChangesSummary<T>>;
+	missingObjects: Record<string, SyncObject<T>>;
 };
 
 type MessageHelloBack<T extends Json> = {
-	catchup: Record<string, VersionInfo<T>[]>;
+	catchup: Record<string, ObjectChangesSummary<T>>;
+	missingObjects: Record<string, SyncObject<T>>;
 };
+
+type MessageHelloBackBack<T extends Json> = {
+	missingAcks: Record<string, string[]>;
+};
+
+type MessageHelloBackBackAck = {};
 
 type MessageAckVersion = {
 	objectId: string;
 	version: string;
 };
 
-type MessageRealtimePatch<T> = {
-	sourcePeer: string;
+type MessageCollapse<T> = {
 	objectId: string;
-	patch: Patch<T>;
-};
-
-type MessageRealtimePatchAck = {
-	objectId: string;
-	version: string;
+	newBase: T;
+	newRoot: string;
+	removeVersions: string[];
 };
 
 export class SyncClient<T> extends EventEmitter {
@@ -190,6 +54,7 @@ export class SyncClient<T> extends EventEmitter {
 	topic: string;
 	identity: string;
 	private isServer: boolean;
+	private _knownPeers = new Set<string>();
 
 	private _peers: Record<string, SyncClient<T>> = {};
 	get peers() {
@@ -355,11 +220,33 @@ export class SyncClient<T> extends EventEmitter {
 		console.log(this.identity, 'received ack of', version, 'from', fromPeer);
 	};
 
-	private receiveHello = (fromPeer: string, msg: MessageHello<T>) => {
-		for (const [id, versions] of Object.entries(msg.catchup)) {
-			for (const version of versions) {
+	private mergePeerAcks = (
+		objectId: string,
+		peerAcks: Record<string, string[]>
+	) => {
+		const obj = this._objects[objectId];
+		if (!obj) throw new Error('No object with id ' + objectId);
+		for (const [peerId, versions] of Object.entries(peerAcks)) {
+			// this should probably be done somewhere more intentional
+			this._knownPeers.add(peerId);
+
+			console.log(this.identity, 'merging acks', peerId, versions);
+			if (!obj.peerAcks[peerId]) {
+				obj.peerAcks[peerId] = new Set();
+			}
+			mergeToSet(obj.peerAcks[peerId], versions);
+		}
+	};
+
+	private applyCatchup = (
+		fromPeer: string,
+		catchup: Record<string, ObjectChangesSummary<T>>
+	) => {
+		for (const [id, summary] of Object.entries(catchup)) {
+			for (const version of summary.versions) {
 				this.receiveVersion(fromPeer, { objectId: id, version });
 			}
+			this.mergePeerAcks(id, summary.peerAcks);
 			// case: server connects to new client and learns of a divergent
 			// history branch. server needs to merge the branches and
 			// send the new history to the new client.
@@ -367,11 +254,41 @@ export class SyncClient<T> extends EventEmitter {
 				this.mergeLeaves(this._objects[id]);
 			}
 		}
-		const backlog = this.getVersionsFor(fromPeer);
+	};
+
+	private applyMissingObjects = (
+		fromPeer: string,
+		missingObjects: Record<string, SyncObject<T>>
+	) => {
+		for (const [id, obj] of Object.entries(missingObjects)) {
+			this._objects[id] = obj;
+			const allVersions = Object.keys(obj.history.versions);
+			for (const version of allVersions) {
+				this.receiveVersionAck(this.identity, {
+					objectId: id,
+					version,
+				});
+				this._peers[fromPeer]?.receiveVersionAck(this.identity, {
+					objectId: id,
+					version,
+				});
+			}
+		}
+	};
+
+	private receiveHello = (fromPeer: string, msg: MessageHello<T>) => {
+		console.log(this.identity, 'received hello from', fromPeer, msg);
+		this.applyCatchup(fromPeer, msg.catchup);
+		this.applyMissingObjects(fromPeer, msg.missingObjects);
+
+		const backlog = this.getChangeSummariesFor(fromPeer);
 		console.log(this.identity, 'hello backing', fromPeer);
 		this._peers[fromPeer].receiveHelloBack(this.identity, {
-			catchup: backlog,
+			catchup: backlog.summaries,
+			missingObjects: backlog.missingObjects,
 		});
+
+		setTimeout(this.collapseAllHistory, 3000);
 
 		// case: server is connected to one client and another client
 		// comes online.
@@ -389,8 +306,12 @@ export class SyncClient<T> extends EventEmitter {
 					'with new hello patches from',
 					fromPeer
 				);
+				const { summaries, missingObjects } = this.getChangeSummariesFor(
+					peer.identity
+				);
 				peer.receiveHelloBack(this.identity, {
-					catchup: this.getVersionsFor(peer.identity),
+					catchup: summaries,
+					missingObjects,
 				});
 			}
 		}
@@ -414,40 +335,123 @@ export class SyncClient<T> extends EventEmitter {
 	};
 
 	private receiveHelloBack = (fromPeer: string, msg: MessageHelloBack<T>) => {
-		for (const [id, versions] of Object.entries(msg.catchup)) {
-			for (const version of versions) {
-				this.receiveVersion(fromPeer, { objectId: id, version });
-			}
-		}
+		console.log(this.identity, 'received hello back from', fromPeer, msg);
+		this.applyCatchup(fromPeer, msg.catchup);
+		this.applyMissingObjects(fromPeer, msg.missingObjects);
+
+		setTimeout(this.collapseAllHistory, 3000);
 	};
 
-	private getVersionsFor = (peerId: string) => {
-		const versions: Record<string, Version<T>[]> = {};
+	private getChangeSummariesFor = (peerId: string) => {
+		const summaries: Record<string, ObjectChangesSummary<T>> = {};
+		const missingObjects: Record<string, SyncObject<T>> = {};
+
 		for (const [id, obj] of Object.entries(this._objects)) {
 			// get the acked versions for this peer, defaulting to a new set if needed
-			const peerVersions = (obj.peerAcks[peerId] =
-				obj.peerAcks[peerId] || new Set());
+			const peerVersions = obj.peerAcks[peerId];
 
-			// one catch here is that versions have to be sent in order,
-			// oldest first.
-			for (const version of Object.keys(obj.history.versions)) {
-				if (!peerVersions.has(version)) {
-					if (!versions[id]) versions[id] = [];
-					const versionList = versions[id];
-					// FIXME: this is going to be ugly
-					const childIndex = versionList.findIndex((v) =>
-						v.parents.includes(version)
-					);
-					if (childIndex !== -1) {
-						// insert before child
-						versionList.splice(childIndex, 0, obj.history.versions[version]);
-					} else {
-						versions[id].push(obj.history.versions[version]);
+			if (!peerVersions) {
+				// this is a missing object for that peer - it has not seen it yet
+				obj.peerAcks[peerId] = new Set();
+				// cloning only necessary since this demo is all in-memory - IRL this
+				// would be serialized across the network
+				missingObjects[id] = clone(obj);
+			} else {
+				// this is fairly talkative - all peer acks will be sent for
+				// every object
+				if (!summaries[id]) {
+					summaries[id] = {
+						peerAcks: this.getPeerAcksFor(id),
+						versions: [],
+					};
+				}
+				// one catch here is that versions have to be sent in order,
+				// oldest first.
+				for (const version of Object.keys(obj.history.versions)) {
+					if (!peerVersions.has(version)) {
+						const versionList = summaries[id].versions;
+						// FIXME: this is going to be ugly
+						const childIndex = versionList.findIndex((v) =>
+							v.parents.includes(version)
+						);
+						if (childIndex !== -1) {
+							// insert before child
+							versionList.splice(childIndex, 0, obj.history.versions[version]);
+						} else {
+							versionList.push(obj.history.versions[version]);
+						}
 					}
 				}
 			}
 		}
-		return versions;
+		return { summaries, missingObjects };
+	};
+
+	private getPeerAcksFor = (objectId: string) => {
+		const obj = this._objects[objectId];
+		if (!obj) throw new Error('No object with id ' + objectId);
+		return Object.keys(obj.peerAcks).reduce((acc, peerId) => {
+			console.log(obj.peerAcks[peerId]);
+			acc[peerId] = Array.from(obj.peerAcks[peerId]);
+			return acc;
+		}, {} as Record<string, string[]>);
+	};
+
+	private collapseAllHistory = () => {
+		for (const id of Object.keys(this._objects)) {
+			const collapse = this.getHistoryCollapse(id, this._objects[id]);
+			if (collapse) {
+				this.applyCollapse(collapse);
+			}
+		}
+	};
+
+	private getHistoryCollapse = (objectId: string, obj: SyncObject<T>) => {
+		return getHistoryCollapse(this.identity, objectId, obj, this._knownPeers);
+	};
+
+	private applyCollapse = (msg: MessageCollapse<T>) => {
+		console.log(
+			this.identity,
+			'collapsing history',
+			'removing',
+			msg.removeVersions,
+			'setting new root',
+			msg.newRoot
+		);
+		const obj = this._objects[msg.objectId];
+		if (!obj) return;
+
+		// apply resolved base
+		obj.base = msg.newBase;
+		// set the root pointer
+		obj.history.root = msg.newRoot;
+		// remove parents from the new root
+		if (msg.newRoot) {
+			obj.history.versions[msg.newRoot].parents = [];
+		}
+		// remove the versions from the history
+		obj.history.versions = Object.keys(obj.history.versions).reduce(
+			(acc, version) => {
+				if (!msg.removeVersions.includes(version)) {
+					acc[version] = obj.history.versions[version];
+				}
+				return acc;
+			},
+			{} as Record<string, Version<T>>
+		);
+		// special case: if history is totally collapsed, we should
+		// reset latest
+		if (Object.keys(obj.history.versions).length === 0) {
+			obj.history.latest = undefined;
+		}
+		// also clear the acked versions for all peers since they no longer need to be stored.
+		for (const peer of Object.keys(obj.peerAcks)) {
+			console.log('removing acks', peer, msg.removeVersions);
+			removeFromSet(obj.peerAcks[peer], msg.removeVersions);
+		}
+		this.refreshView(msg.objectId);
+		this.emit(`change:${msg.objectId}`);
 	};
 
 	connect = (peer: SyncClient<T>) => {
@@ -457,14 +461,19 @@ export class SyncClient<T> extends EventEmitter {
 		// simulate mutual connection
 		peer._peers = { ...peer._peers, [this.identity]: this };
 
+		this._knownPeers.add(peer.identity);
+		peer._knownPeers.add(this.identity);
+
 		// negotiate history exchange with peer:
 		// - connecting peer provides its history updates relative to
 		//   its understanding of the other peer's view of history
 		// - other peer responds with any missing history it thinks
 		//   this peer needs
 		// - this peer acks the history
+		const initialHello = this.getChangeSummariesFor(peer.identity);
 		peer.receiveHello(this.identity, {
-			catchup: this.getVersionsFor(peer.identity),
+			catchup: initialHello.summaries,
+			missingObjects: initialHello.missingObjects,
 		});
 
 		this.emit('connected', peer.identity);

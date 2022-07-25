@@ -7,7 +7,7 @@ import {
 	useSyncExternalStore,
 } from 'react';
 import './App.css';
-import { SyncClient, SyncObject } from './sync';
+import { SyncClient } from './sync';
 
 const ClientContext = createContext<SyncClient<Value>>(null as any);
 const useClient = () => useContext(ClientContext);
@@ -22,10 +22,9 @@ const seed = {
 	a: { value: 0 },
 };
 const clientA = new SyncClient<Value>({ topic, seed, identity: 'clientA' });
-const clientB = new SyncClient<Value>({ topic, seed, identity: 'clientB' });
+const clientB = new SyncClient<Value>({ topic, identity: 'clientB' });
 const server = new SyncClient<Value>({
 	topic,
-	seed,
 	identity: 'server',
 	isServer: true,
 });
@@ -35,6 +34,7 @@ const peers = {
 	clientB,
 	server,
 };
+(window as any).peers = peers;
 
 function useObject(client: SyncClient<Value>, id: string) {
 	return useSyncExternalStore(
@@ -48,9 +48,11 @@ function useObject(client: SyncClient<Value>, id: string) {
 
 // don't judge me.
 function deepEqual(...objs: any[]) {
-	console.log(objs.map((obj) => JSON.stringify(obj)));
 	for (let i = 0; i < objs.length; i++) {
 		for (let j = 0; j < objs.length; j++) {
+			if (!objs[i] || !objs[j]) {
+				return false;
+			}
 			if (
 				JSON.stringify(objs[i], Object.keys(objs[i]).sort()) !==
 				JSON.stringify(objs[j], Object.keys(objs[j]).sort())
