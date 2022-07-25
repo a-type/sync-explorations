@@ -343,43 +343,30 @@ Client                                Server
 ------                                ------
 Hello ->
 - For each object I have
-  - Peer ack list hashes
+  - Peer ack lists
   - Changes you haven't acked
   - If you aren't even in an
-    ack list, the whole thing
+    ack list, the whole object
 
                                       I add any new objects you sent
                                       which I haven't seen before.
                                       I merge in any changes which are
                                       new to me.
+                                      I merge in ack lists to mine
 
                                       <- Hello Back
                                       - For each object I have
-                                        - Peer ack list hashes
-                                        - If your ack list hash differed,
-                                          I send the whole list
+                                        - Peer ack lists
                                         - Changes you haven't acked
                                         - If you aren't even in an
-                                          ack list, the whole thing
+                                          ack list, the whole object
 
 I add any new objects you sent
 which I haven't seen before.
 I merge in any changes which are
 new to me.
 I merge in any ack lists which
-you sent based on hashes.
-I compare the new hashes to
-the hashes you sent me.
-
-Hello Back Back ->
-- For any ack lists whose final
-  hashes weren't the same as
-  the hashes you sent me with
-  your edits, I send you my
-  full ack list.
-                                     I merge in any ack lists you sent me
-
-                                     <- Final Ack of all that
+you sent.
 
 Now I can prune history!             Now I can prune history!
 ```
